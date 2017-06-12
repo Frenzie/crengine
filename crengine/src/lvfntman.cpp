@@ -703,7 +703,7 @@ static lUInt16 char_flags[] = {
 #define GET_CHAR_FLAGS(ch) \
      (ch<48?char_flags[ch]: \
         (ch==UNICODE_SOFT_HYPHEN_CODE?LCHAR_ALLOW_WRAP_AFTER: \
-        (ch==UNICODE_NO_BREAK_SPACE?LCHAR_IS_SPACE: \
+        (ch==UNICODE_NO_BREAK_SPACE?LCHAR_DEPRECATED_WRAP_AFTER|LCHAR_IS_SPACE: \
         (ch==UNICODE_HYPHEN?LCHAR_DEPRECATED_WRAP_AFTER: \
         (ch==UNICODE_ZERO_WIDTH_SPACE?LCHAR_ALLOW_WRAP_AFTER: \
         (ch==UNICODE_THIN_SPACE?LCHAR_ALLOW_WRAP_AFTER: \
@@ -2955,10 +2955,10 @@ public:
     virtual LVFontRef GetFont(int size, int weight, bool bitalic, css_font_family_t family, lString8 typeface )
     {
         int italic = bitalic?1:0;
-        if (size<10)
-            size = 10;
-        if (size>52)
-            size = 52;
+        if (size<8)
+            size = 8;
+        if (size>255)
+            size = 255;
 
         LVFontDef def(
             lString8::empty_str,
