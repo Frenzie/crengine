@@ -1,8 +1,6 @@
----
 exclude_paths:
   - android/**
   - cr3gui/**
   - cr3qt/**
   - cr3wx/**
-  - cr3wx/**
-
+  - thirdparty/**
