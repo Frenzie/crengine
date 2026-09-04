@@ -175,6 +175,9 @@ public:
     bool isFullChecking() const { return _type == cssrt_ancessor || _type == cssrt_predsibling; }
     lUInt32 getHash() const;
     lUInt32 getWeight() const;
+    LVCssSelectorRuleType getType() const { return _type; }
+    /// Class hash for class rules, 0 otherwise.
+    lUInt32 getClassValueHash() const { return (_type==cssrt_class) ? _valueHash : 0; }
 };
 
 /** \brief simple CSS selector
@@ -203,6 +206,7 @@ public:
     ~LVCssSelector() { if (_next) delete _next; } // NOLINT(clang-analyzer-cplusplus.NewDelete)
     bool parse( const char * &str, lxmlDocBase * doc, bool useragent_sheet=false, bool for_functional_pseudo_class=false );
     lUInt16 getElementNameId() const { return _id; }
+    int getPseudoElem() const { return _pseudo_elem; }
     bool check( const ldomNode * node, bool allow_cache=true ) const;
     bool quickClassCheck(const lUInt32 *classHashes, size_t size) const;
     void applyToPseudoElement( const ldomNode * node, css_style_rec_t * style ) const;
@@ -232,6 +236,8 @@ public:
     LVCssSelector * getNext() const { return _next; }
     void setNext(LVCssSelector * next) { _next = next; }
     lUInt32 getHash() const;
+    /// The selector's leading rule (rightmost of the chain), or NULL if none.
+    const LVCssSelectorRule * getFirstRule() const { return _rules.get(); }
     LVCssSelector * getCopy() const {
         // Return a copy (with everything except _next) that can
         // be delete()'d without impacting this LVCssSelector
@@ -278,6 +284,27 @@ private:
 
     LVPtrVector <LVCssSelector> _selectors;
     LVPtrVector <LVPtrVector <LVCssSelector> > _stack;
+
+    // Lazily-built index of _selectors[0] (the chain of selectors whose
+    // leading rule is NOT an element name). Buckets the chain by leading class
+    // so `apply()` only visits selectors a node could match. Buckets are
+    // subsequences of the chain, so cascade order is preserved.
+    struct SEL0Entry {
+        LVCssSelector * sel;
+        lUInt32         chainIndex; // position in the _selectors[0] chain (for ties)
+        SEL0Entry() : sel(NULL), chainIndex(0) { }
+        SEL0Entry(LVCssSelector * s, lUInt32 i) : sel(s), chainIndex(i) { }
+    };
+    // selectors whose leading rule is not a class (universal/type/attr/pseudo/empty)
+    LVArray<SEL0Entry> _sel0NoClass;
+    // classHash -> bucket of selectors whose leading rule is that class
+    // (parallel arrays: _sel0ClassHashes[i] <-> _sel0ClassBuckets[i])
+    LVArray<lUInt32> _sel0ClassHashes;
+    LVArray<LVArray<SEL0Entry> > _sel0ClassBuckets;
+    bool               _sel0IndexReady;
+    void buildSel0Index();
+    static inline bool isClassLeading(const LVCssSelector * s);
+
     LVPtrVector <LVCssSelector> * dup()
     {
         LVPtrVector <LVCssSelector> * res = new LVPtrVector <LVCssSelector>();
@@ -352,11 +379,15 @@ public:
         _selectors.clear();
         _stack.clear();
         _fontFaceDecls.clear();
+        _sel0IndexReady = false;
+        _sel0NoClass.clear();
+        _sel0ClassHashes.clear();
+        _sel0ClassBuckets.clear();
     }
     /// set document to retrieve ID values from
     void setDocument( lxmlDocBase * doc ) { _doc = doc; }
     /// constructor
-    LVStyleSheet( lxmlDocBase * doc=NULL, bool nested=false ) : _doc(doc) , _nested(nested) , _selector_count(0) { }
+    LVStyleSheet( lxmlDocBase * doc=NULL, bool nested=false ) : _doc(doc) , _nested(nested) , _selector_count(0) , _sel0IndexReady(false) { }
     /// copy constructor
     LVStyleSheet( LVStyleSheet & sheet );
     /// parse stylesheet, compile and add found rules to sheet

@@ -7775,6 +7775,7 @@ LVCssSelector::LVCssSelector( LVCssSelector & v )
 void LVStyleSheet::set(LVPtrVector<LVCssSelector> & v  )
 {
     _selectors.clear();
+    _sel0IndexReady = false;
     if ( !v.size() )
         return;
     _selectors.reserve( v.size() );
@@ -7812,11 +7813,53 @@ static void for_each_split(const lChar32 *begin, F functor) {
         functor(begin, end);
 }
 
+bool LVStyleSheet::isClassLeading(const LVCssSelector * s)
+{
+    // True when the leading rule is a class rule and the selector isn't a
+    // pseudo-element. Otherwise quickClassCheck() passes unconditionally.
+    if ( s->getPseudoElem() > 0 )
+        return false;
+    const LVCssSelectorRule * r = s->getFirstRule();
+    return r && r->getType() == cssrt_class;
+}
+
+void LVStyleSheet::buildSel0Index()
+{
+    // Build the fast lookup buckets for the _selectors[0] chain.
+    LVCssSelector * s = _selectors[0];
+    _sel0NoClass.clear();
+    _sel0ClassHashes.clear();
+    _sel0ClassBuckets.clear();
+    lUInt32 idx = 0;
+    for ( ; s; s = s->getNext(), idx++ ) {
+        if ( !isClassLeading(s) ) {
+            _sel0NoClass.add( SEL0Entry(s, idx) );
+            continue;
+        }
+        lUInt32 classHash = s->getFirstRule()->getClassValueHash();
+        // linear scan; buckets are few and this runs rarely
+        int bi = -1;
+        for ( int i=0; i<_sel0ClassHashes.length(); i++ ) {
+            if ( _sel0ClassHashes[i] == classHash ) {
+                bi = i;
+                break;
+            }
+        }
+        if ( bi < 0 ) {
+            bi = _sel0ClassHashes.length();
+            _sel0ClassHashes.add( classHash );
+            _sel0ClassBuckets.add( LVArray<SEL0Entry>() );
+        }
+        _sel0ClassBuckets[bi].add( SEL0Entry(s, idx) );
+    }
+    _sel0IndexReady = true;
+}
+
 void LVStyleSheet::apply( const ldomNode * node, css_style_rec_t * style ) const
 {
     if (!_selectors.length())
         return; // no rules!
-        
+
     lUInt16 id = node->getNodeId();
     if ( id == el_body && node->getParentNode()->isRoot() ) {
         // Don't apply anything to the <body> container of <DocFragment>
@@ -7884,8 +7927,14 @@ void LVStyleSheet::apply( const ldomNode * node, css_style_rec_t * style ) const
     // first checked agains all <p>).
     // To see which selectors apply to a <p>, we must iterate thru both chains,
     // checking and applying them in the order of specificity/parsed position.
-    LVCssSelector * selector_0 = _selectors[0];
+    //
+    // We merge only the _selectors[0] buckets a node can match (see
+    // buildSel0Index) with the _selectors[id] chain, in specificity order.
     LVCssSelector * selector_id = id>0 && id<_selectors.length() ? _selectors[id] : NULL;
+
+    if ( !_sel0IndexReady ) {
+        const_cast<LVStyleSheet*>(this)->buildSel0Index();
+    }
 
     LVArray<lUInt32> class_hash_array;
     const lString32 &v = node->getEffectiveAttributeValue(attr_class);
@@ -7893,35 +7942,88 @@ void LVStyleSheet::apply( const ldomNode * node, css_style_rec_t * style ) const
         class_hash_array.add(lString32::getHash(begin, end));
     });
 
-    for (;;)
-    {
-        if (selector_0!=NULL)
-        {
-            if (selector_id==NULL || selector_0->getSpecificity() < selector_id->getSpecificity() )
-            {
-                // step by sel_0
-                if (selector_0->quickClassCheck(class_hash_array.ptr(), class_hash_array.length()))
-                    selector_0->apply( node, style );
-                selector_0 = selector_0->getNext();
-            }
-            else
-            {
-                // step by sel_id
-                if (selector_id->quickClassCheck(class_hash_array.ptr(), class_hash_array.length()))
-                    selector_id->apply( node, style );
-                selector_id = selector_id->getNext();
+    // Cursors: one per selectable _selectors[0] bucket plus one for the
+    // _selectors[id] chain. A bucket cursor reads bucket[pos]; the id cursor
+    // walks its linked chain.
+    struct Cursor {
+        const LVArray<SEL0Entry> * bucket; // NULL for the selector_id chain
+        int                         pos;
+        LVCssSelector             * sel;
+        lUInt32                     chainIndex;
+        lUInt32                     specificity;
+        bool                        isSelId;
+    };
+
+    LVArray<Cursor> cursors;
+    cursors.reserve( class_hash_array.length() + 2 );
+
+    auto addBucketCursor = [&]( const LVArray<SEL0Entry> * b ) {
+        if (!b || b->length()==0) return;
+        Cursor c;
+        c.bucket = b; c.pos = 0; c.isSelId = false;
+        c.sel = (*b)[0].sel; c.chainIndex = (*b)[0].chainIndex; c.specificity = c.sel->getSpecificity();
+        cursors.add(c);
+    };
+
+    addBucketCursor( &_sel0NoClass );
+    const LVArray<SEL0Entry> * classBucketsPtr = _sel0ClassBuckets.ptr();
+    if ( classBucketsPtr ) {
+        for ( int ci=0; ci<class_hash_array.length(); ci++ ) {
+            lUInt32 h = class_hash_array[ci];
+            for ( int bi=0; bi<_sel0ClassHashes.length(); bi++ ) {
+                if ( _sel0ClassHashes[bi] == h ) {
+                    addBucketCursor( &classBucketsPtr[bi] );
+                    break;
+                }
             }
         }
-        else if (selector_id!=NULL)
-        {
-            // step by sel_id
-            if (selector_id->quickClassCheck(class_hash_array.ptr(), class_hash_array.length()))
-                selector_id->apply( node, style );
-            selector_id = selector_id->getNext();
+    }
+    if ( selector_id ) {
+        Cursor c;
+        c.bucket = NULL; c.pos = 0; c.isSelId = true;
+        c.sel = selector_id; c.chainIndex = 0; c.specificity = selector_id->getSpecificity();
+        cursors.add(c);
+    }
+
+    // pick the cursor with the lowest specificity (ties: selector_id chain
+    // wins, then lower chainIndex), apply it, and advance it.
+    for (;;) {
+        int best = -1;
+        for ( int i=0; i<cursors.length(); i++ ) {
+            if ( cursors[i].sel == NULL ) continue;
+            if ( best < 0 ) {
+                best = i;
+                continue;
+            }
+            const Cursor & a = cursors[best];
+            const Cursor & b = cursors[i];
+            bool better = false;
+            if ( b.specificity < a.specificity ) {
+                better = true;
+            } else if ( b.specificity == a.specificity ) {
+                if ( b.isSelId && !a.isSelId ) better = true;
+                else if ( b.isSelId == a.isSelId && b.chainIndex < a.chainIndex ) better = true;
+            }
+            if ( better ) best = i;
         }
-        else
-        {
-            break; // end of chains
+        if ( best < 0 ) break;
+
+        Cursor & cur = cursors[best];
+        if ( cur.sel->quickClassCheck(class_hash_array.ptr(), class_hash_array.length()) )
+            cur.sel->apply( node, style );
+
+        // advance
+        if ( cur.bucket ) {
+            cur.pos++;
+            if ( cur.pos < cur.bucket->length() ) {
+                const SEL0Entry & e = (*cur.bucket)[cur.pos];
+                cur.sel = e.sel; cur.chainIndex = e.chainIndex; cur.specificity = e.sel->getSpecificity();
+            } else {
+                cur.sel = NULL;
+            }
+        } else {
+            cur.sel = cur.sel->getNext();
+            if ( cur.sel ) { cur.chainIndex = 0; cur.specificity = cur.sel->getSpecificity(); }
         }
     }
 }
@@ -8093,6 +8195,7 @@ bool LVStyleSheet::parseAndAdvance( const char * &str, bool useragent_sheet, lSt
                 next = p->getNext();
                 insert_into_selectors(p, _selectors);
             }
+            _sel0IndexReady = false;
         }
     }
     return _selectors.length() > 0;
@@ -8176,6 +8279,7 @@ bool LVStyleSheet::gatherNodeMatchingRulesets(ldomNode * node, const char * str,
 }
 
 void LVStyleSheet::merge(const LVStyleSheet &other) {
+    _sel0IndexReady = false;
     int length = other._selectors.length();
     if (length > _selectors.length())
         _selectors.set(length - 1, nullptr);
